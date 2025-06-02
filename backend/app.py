@@ -1,10 +1,18 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 import os
 import tempfile
 import uuid
-from datetime import datetime
+import pickle
+from datetime import datetime, timedelta
+import json
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
+from flask_bcrypt import Bcrypt
+import jwt
+from functools import wraps
+import os.path
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_experimental.text_splitter import SemanticChunker
@@ -14,44 +22,123 @@ from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.chains.llm import LLMChain
 from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-from langchain.chains import RetrievalQA, ConversationalRetrievalChain
+from langchain.chains import ConversationalRetrievalChain
+
+from models import db, User, File, ChatHistory
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app, supports_credentials=True)  # Enable CORS with credential support
+bcrypt = Bcrypt(app)
 
 # Configuration
-UPLOAD_FOLDER = tempfile.mkdtemp()
+UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', tempfile.mkdtemp())
+VECTOR_STORE_FOLDER = os.environ.get('VECTOR_STORE_FOLDER', os.path.join(UPLOAD_FOLDER, 'vector_stores'))
 ALLOWED_EXTENSIONS = {'pdf'}
-MAX_FILES = 5
+MAX_FILES = 10
+JWT_SECRET = os.environ.get('JWT_SECRET', 'pou-78392gec9gi&**Y(1bvyi183)#UI@yujkbnn::s')
+JWT_EXPIRATION = 24  # hours
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', 'your-google-client-id.apps.googleusercontent.com')
+
+# Database configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/pou_chat')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize database
+db.init_app(app)
+
+# Ensure directories exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(VECTOR_STORE_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max file size
 
-# In-memory storage
-user_files = {}  # Store user files: {user_id: {file_id: {name, path, size, uploaded_at}}}
+# In-memory storage for retrievers
 user_retrievers = {}  # Store user retrievers: {user_id: retriever}
-user_chat_history = {}  # Store user chat history: {user_id: [{user, bot, timestamp}]}
+
+# Load vector stores on startup
+def load_vector_stores():
+    try:
+        for user_dir in os.listdir(VECTOR_STORE_FOLDER):
+            user_path = os.path.join(VECTOR_STORE_FOLDER, user_dir)
+            if os.path.isdir(user_path):
+                try:
+                    # Load the vector store if it exists
+                    embedder = HuggingFaceEmbeddings()
+                    vector_store = FAISS.load_local(user_path, embedder)
+                    user_retrievers[user_dir] = vector_store.as_retriever(
+                        search_type="similarity", search_kwargs={"k": 4}
+                    )
+                    print(f"Loaded vector store for user {user_dir}")
+                except Exception as e:
+                    print(f"Error loading vector store for user {user_dir}: {str(e)}")
+    except Exception as e:
+        print(f"Error loading vector stores: {str(e)}")
+
+# Load vector stores on startup
+load_vector_stores()
+
+# Authentication helper functions
+def generate_token(user_id, email):
+    payload = {
+        'user_id': user_id,
+        'email': email,
+        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRATION)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        # Check for token in headers
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({'success': False, 'message': 'Authentication token is missing'}), 401
+        
+        try:
+            # Decode token
+            data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            current_user = data['user_id']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'success': False, 'message': 'Token has expired'}), 401
+        except Exception as e:
+            return jsonify({'success': False, 'message': f'Invalid token: {str(e)}'}), 401
+            
+        # Pass the current user to the route
+        return f(current_user, *args, **kwargs)
+    
+    return decorated
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def process_user_files(user_id):
-    """Process all files for a user and create a retriever"""
-    if user_id not in user_files or not user_files[user_id]:
+    """Process all files for a user and create/update retriever"""
+    user_files = File.query.filter_by(user_id=user_id).all()
+    if not user_files:
         return {"success": False, "message": "No files uploaded"}
     
     # Load all documents
     all_documents = []
-    for file_id, file_info in user_files[user_id].items():
+    for file_info in user_files:
         try:
-            loader = PDFPlumberLoader(file_info['path'])
+            # Check if file exists
+            if not os.path.exists(file_info.path):
+                continue
+                
+            loader = PDFPlumberLoader(file_info.path)
             docs = loader.load()
             # Add source information
             for doc in docs:
-                doc.metadata['source'] = file_info['name']
+                doc.metadata['source'] = file_info.name
             all_documents.extend(docs)
         except Exception as e:
-            return {"success": False, "message": f"Error loading {file_info['name']}: {str(e)}"}
+            return {"success": False, "message": f"Error loading {file_info.name}: {str(e)}"}
     
     if not all_documents:
         return {"success": False, "message": "No documents could be loaded"}
@@ -70,6 +157,12 @@ def process_user_files(user_id):
             search_type="similarity", 
             search_kwargs={"k": 4}
         )
+        
+        # Save vector store to disk
+        user_vector_dir = os.path.join(VECTOR_STORE_FOLDER, user_id)
+        os.makedirs(user_vector_dir, exist_ok=True)
+        vector_store.save_local(user_vector_dir)
+        
         return {"success": True, "message": "Files processed successfully"}
     except Exception as e:
         return {"success": False, "message": f"Error processing files: {str(e)}"}
@@ -82,259 +175,281 @@ def generate_response(user_id, user_input):
     retriever = user_retrievers[user_id]
     
     try:
-        # Define LLM
+        # Create the LLM
         llm = Ollama(model="deepseek-r1:1.5b")
         
-        # Define the prompt template
-        prompt = """
-            Use the following pieces of context to answer the question at the end. 
-            If you don't know the answer, say you don't know, but don't make up an answer.
-            Be concise but thorough.
+        # Create the prompt template
+        template = """You are an AI assistant helping users understand documents. Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
-            Chat History:
-            {chat_history}
+        Context: {context}
 
-            Context: 
-            {context}
+        Question: {question}
 
-            Question: {question}
-
-            Helpful Answer:
-            """
+        Answer:"""
         
-        # Create prompt template
-        QA_CHAIN_PROMPT = PromptTemplate.from_template(prompt)
-        
-        # Create the LLM chain
-        llm_chain = LLMChain(
-            llm=llm,
-            prompt=QA_CHAIN_PROMPT,
-            verbose=False
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=["context", "question"]
         )
         
-        # Create document prompt
-        document_prompt = PromptTemplate(
-            input_variables=["page_content", "source"],
-            template="Content: {page_content}\nSource: {source}\n"
-        )
+        # Create the chain
+        chain = LLMChain(llm=llm, prompt=prompt)
         
-        # Create the document chain
-        combine_documents_chain = StuffDocumentsChain(
-            llm_chain=llm_chain,
-            document_variable_name="context",
-            document_prompt=document_prompt
-        )
+        # Get relevant documents
+        docs = retriever.get_relevant_documents(user_input)
         
-        # Initialize chat history if it doesn't exist
-        if user_id not in user_chat_history:
-            user_chat_history[user_id] = []
-            
-        # Format chat history for the chain
-        formatted_history = []
-        if user_chat_history[user_id]:
-            for entry in user_chat_history[user_id][-5:]:
-                formatted_history.append((entry['user'], entry['bot']))
-        
-        # Create the QA chain
-        qa = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            chain_type="stuff",
-            combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT},
-            return_source_documents=True
-        )
+        # Combine documents
+        combined_docs = "\n\n".join([doc.page_content for doc in docs])
         
         # Generate response
-        print(f"User Input: {user_input}")
-        response = qa({"question": user_input, "chat_history": formatted_history})
+        response = chain.run(context=combined_docs, question=user_input)
         
-        # Format sources
-        sources = []
-        for doc in response.get("source_documents", []):
-            source = doc.metadata.get("source", "Unknown")
-            page = doc.metadata.get("page", "")
-            if source not in sources:
-                sources.append(f"{source} (page {page})" if page else source)
-        
-        # Add current exchange to chat history
-        user_chat_history[user_id].append({
-            'user': user_input,
-            'bot': response['answer'],  
-            'timestamp': datetime.now().isoformat()
-        })
+        # Get sources
+        sources = list(set([doc.metadata.get('source', 'Unknown') for doc in docs]))
         
         return {
-            "success": True, 
-            "message": response['answer'],
+            "success": True,
+            "message": response,
             "sources": sources
         }
-        
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
         return {"success": False, "message": f"Error generating response: {str(e)}"}
 
 # Routes
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "ok", "message": "API is running"})
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({'success': False, 'message': 'Missing required fields'}), 400
+    
+    # Check if user already exists
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({'success': False, 'message': 'Email already registered'}), 400
+    
+    try:
+        # Create new user
+        user = User(
+            email=data['email'],
+            password_hash=bcrypt.generate_password_hash(data['password']).decode('utf-8')
+        )
+        db.session.add(user)
+        db.session.commit()
+        
+        # Generate token
+        token = generate_token(user.id, user.email)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'token': token,
+            'user': user.to_dict()
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Registration failed: {str(e)}'}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    
+    if not data or not data.get('email') or not data.get('password'):
+        return jsonify({'success': False, 'message': 'Missing required fields'}), 400
+    
+    try:
+        # Find user
+        user = User.query.filter_by(email=data['email']).first()
+        
+        if not user or not bcrypt.check_password_hash(user.password_hash, data['password']):
+            return jsonify({'success': False, 'message': 'Invalid email or password'}), 401
+        
+        # Generate token
+        token = generate_token(user.id, user.email)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'token': token,
+            'user': user.to_dict()
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Login failed: {str(e)}'}), 500
 
 @app.route('/api/upload', methods=['POST'])
-def upload_file():
-    """Upload a file to the server"""
-    # Check if the post request has the file part
+@token_required
+def upload_file(current_user):
     if 'file' not in request.files:
-        return jsonify({"success": False, "message": "No file part"}), 400
-        
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.form.get('user_id', 'default_user')
-    
-    # Initialize user storage if needed
-    if user_id not in user_files:
-        user_files[user_id] = {}
-    
-    # Check if max files limit is reached
-    if len(user_files[user_id]) >= MAX_FILES:
-        return jsonify({"success": False, "message": f"Maximum of {MAX_FILES} files allowed"}), 400
+        return jsonify({'success': False, 'message': 'No file provided'}), 400
         
     file = request.files['file']
     
-    # Check if file selected
     if file.filename == '':
-        return jsonify({"success": False, "message": "No file selected"}), 400
+        return jsonify({'success': False, 'message': 'No file selected'}), 400
         
-    # Check file type
     if not allowed_file(file.filename):
-        return jsonify({"success": False, "message": "File type not allowed"}), 400
-        
-    # Save file
+        return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+    
+    # Check max files
+    file_count = File.query.filter_by(user_id=current_user).count()
+    if file_count >= MAX_FILES:
+        return jsonify({'success': False, 'message': f'Maximum of {MAX_FILES} files allowed'}), 400
+    
     try:
+        # Save file
         filename = secure_filename(file.filename)
-        file_id = str(uuid.uuid4())
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{filename}")
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{current_user}_{filename}")
         file.save(file_path)
         
-        # Store file info
-        user_files[user_id][file_id] = {
-            'name': filename,
-            'path': file_path,
-            'size': os.path.getsize(file_path),
-            'uploaded_at': datetime.now().isoformat()
-        }
+        # Create file record
+        new_file = File(
+            user_id=current_user,
+            name=filename,
+            path=file_path,
+            size=os.path.getsize(file_path)
+        )
+        db.session.add(new_file)
+        db.session.commit()
         
         return jsonify({
-            "success": True, 
-            "message": "File uploaded successfully",
-            "file_id": file_id,
-            "file_name": filename,
-            "file_count": len(user_files[user_id])
+            'success': True,
+            'message': 'File uploaded successfully',
+            'file': new_file.to_dict()
         })
     except Exception as e:
-        return jsonify({"success": False, "message": f"Error uploading file: {str(e)}"}), 500
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Upload failed: {str(e)}'}), 500
 
 @app.route('/api/files', methods=['GET'])
-def get_files():
-    """Get list of uploaded files for a user"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.args.get('user_id', 'default_user')
-    
-    if user_id not in user_files:
-        return jsonify({"success": True, "files": []})
-    
-    files_list = []
-    for file_id, file_info in user_files[user_id].items():
-        files_list.append({
-            "id": file_id,
-            "name": file_info['name'],
-            "size": file_info['size'],
-            "uploaded_at": file_info['uploaded_at']
+@token_required
+def get_files(current_user):
+    try:
+        files = File.query.filter_by(user_id=current_user).all()
+        return jsonify({
+            'success': True,
+            'files': [file.to_dict() for file in files]
         })
-    
-    return jsonify({"success": True, "files": files_list})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Failed to fetch files: {str(e)}'}), 500
 
 @app.route('/api/files/<file_id>', methods=['DELETE'])
-def delete_file(file_id):
-    """Delete a file"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.args.get('user_id', 'default_user')
-    
-    if user_id not in user_files or file_id not in user_files[user_id]:
-        return jsonify({"success": False, "message": "File not found"}), 404
-    
+@token_required
+def delete_file(current_user, file_id):
     try:
-        # Remove file from disk
-        os.remove(user_files[user_id][file_id]['path'])
+        file = File.query.filter_by(id=file_id, user_id=current_user).first()
+        if not file:
+            return jsonify({'success': False, 'message': 'File not found'}), 404
         
-        # Remove from storage
-        del user_files[user_id][file_id]
+        # Delete physical file
+        if os.path.exists(file.path):
+            os.remove(file.path)
         
-        # Clear retriever if no files left
-        if not user_files[user_id] and user_id in user_retrievers:
-            del user_retrievers[user_id]
+        # Delete from database
+        db.session.delete(file)
+        db.session.commit()
         
-        return jsonify({"success": True, "message": "File deleted successfully"})
+        return jsonify({'success': True, 'message': 'File deleted successfully'})
     except Exception as e:
-        return jsonify({"success": False, "message": f"Error deleting file: {str(e)}"}), 500
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Failed to delete file: {str(e)}'}), 500
 
 @app.route('/api/process', methods=['POST'])
-def process_files():
-    """Process files and create retriever"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.json.get('user_id', 'default_user')
-    
-    result = process_user_files(user_id)
-    
-    if result["success"]:
-        return jsonify(result)
-    else:
-        return jsonify(result), 400
+@token_required
+def process_files(current_user):
+    result = process_user_files(current_user)
+    return jsonify(result)
 
 @app.route('/api/chat', methods=['POST'])
-def chat():
-    """Generate a response"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.json.get('user_id', 'default_user')
-    user_input = request.json.get('message', '')
+@token_required
+def chat(current_user):
+    data = request.get_json()
     
-    if not user_input:
-        return jsonify({"success": False, "message": "Message is required"}), 400
+    if not data or not data.get('message'):
+        return jsonify({'success': False, 'message': 'No message provided'}), 400
     
-    result = generate_response(user_id, user_input)
-    print(f"Generate Response Result: {result}")
-    
-    if result["success"]:
-        return jsonify(result)
-    else:
-        return jsonify(result), 400
+    try:
+        # Generate response
+        response = generate_response(current_user, data['message'])
+        
+        if response['success']:
+            # Save to chat history
+            chat_entry = ChatHistory(
+                user_id=current_user,
+                user_message=data['message'],
+                bot_message=response['message'],
+                sources=response.get('sources', [])
+            )
+            db.session.add(chat_entry)
+            db.session.commit()
+            
+            response['chat_id'] = chat_entry.id
+        
+        return jsonify(response)
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Chat failed: {str(e)}'}), 500
 
 @app.route('/api/history', methods=['GET'])
-def get_history():
-    """Get chat history for a user"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.args.get('user_id', 'default_user')
-    
-    if user_id not in user_chat_history:
-        return jsonify({"success": True, "history": []})
-    
-    return jsonify({
-        "success": True, 
-        "history": user_chat_history[user_id]
-    })
+@token_required
+def get_history(current_user):
+    try:
+        history = ChatHistory.query.filter_by(user_id=current_user).order_by(ChatHistory.timestamp.desc()).all()
+        return jsonify({
+            'success': True,
+            'history': [entry.to_dict() for entry in history]
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Failed to fetch history: {str(e)}'}), 500
 
 @app.route('/api/history', methods=['DELETE'])
-def clear_history():
-    """Clear chat history for a user"""
-    # Get user ID (in a real app, this would come from authentication)
-    user_id = request.json.get('user_id', 'default_user')
-    
-    if user_id in user_chat_history:
-        user_chat_history[user_id] = []
-    
-    return jsonify({
-        "success": True, 
-        "message": "Chat history cleared"
-    })
+@token_required
+def clear_history(current_user):
+    try:
+        ChatHistory.query.filter_by(user_id=current_user).delete()
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Chat history cleared'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Failed to clear history: {str(e)}'}), 500
+
+@app.route('/api/history/<history_id>', methods=['DELETE'])
+@token_required
+def delete_history_item(current_user, history_id):
+    try:
+        chat_entry = ChatHistory.query.filter_by(id=history_id, user_id=current_user).first()
+        if not chat_entry:
+            return jsonify({'success': False, 'message': 'Chat entry not found'}), 404
+        
+        db.session.delete(chat_entry)
+        db.session.commit()
+        
+        return jsonify({'success': True, 'message': 'Chat entry deleted'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': f'Failed to delete chat entry: {str(e)}'}), 500
+
+@app.route('/api/user/status', methods=['GET'])
+@token_required
+def get_user_status(current_user):
+    try:
+        file_count = File.query.filter_by(user_id=current_user).count()
+        has_retriever = current_user in user_retrievers
+        has_history = ChatHistory.query.filter_by(user_id=current_user).count() > 0
+        
+        return jsonify({
+            'success': True,
+            'status': {
+                'has_files': file_count > 0,
+                'has_retriever': has_retriever,
+                'has_history': has_history,
+                'file_count': file_count
+            }
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Failed to get user status: {str(e)}'}), 500
+
+# Create database tables
+with app.app_context():
+    db.create_all()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True)
