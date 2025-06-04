@@ -13,17 +13,19 @@ A modern web application that combines Flask backend with React frontend, implem
 
 ## Screenshots
 
-![Chat Interface](screenshots/Screenshot%202025-06-02%20122502.png)
-*Main chat interface with document processing capabilities*
+![Register](screenshots/Screenshot%202025-06-02%20122502.png)
+*Auth Pages: Register*
 
-![Document Upload](screenshots/Screenshot%202025-06-02%20122447.png)
-*Document upload and processing interface*
+![Login](screenshots/Screenshot%202025-06-02%20122447.png)
+*Auth Pages: Login*
 
-![Search Results](screenshots/Screenshot%202025-06-02%20122157.png)
-*Advanced search results and document retrieval*
+![Chat](screenshots/Screenshot%202025-06-02%20122133.png)
+*Chat Interface*
 
-![User Dashboard](screenshots/Screenshot%202025-06-02%20122133.png)
-*User dashboard with document management*
+![Settings](screenshots/Screenshot%202025-06-02%20122157.png)
+*Simple Settings*
+
+
 
 ## Tech Stack
 
