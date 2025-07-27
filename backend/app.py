@@ -19,10 +19,8 @@ from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain.chains.llm import LLMChain
-from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-from langchain.chains import ConversationalRetrievalChain
 
 from models import db, User, File, ChatHistory
 
@@ -53,8 +51,9 @@ os.makedirs(VECTOR_STORE_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB max file size
 
-# In-memory storage for retrievers
+# In-memory storage for retrievers and conversation history
 user_retrievers = {}  # Store user retrievers: {user_id: retriever}
+user_conversations = {}  # Store conversation history: {user_id: [{"human": "...", "ai": "..."}]}
 
 # Load vector stores on startup
 def load_vector_stores():
@@ -167,42 +166,80 @@ def process_user_files(user_id):
     except Exception as e:
         return {"success": False, "message": f"Error processing files: {str(e)}"}
 
+def get_conversation_history(user_id, limit=5):
+    """Get recent conversation history for context"""
+    try:
+        recent_history = ChatHistory.query.filter_by(user_id=user_id)\
+            .order_by(ChatHistory.timestamp.desc())\
+            .limit(limit)\
+            .all()
+        
+        # Reverse to get chronological order
+        recent_history.reverse()
+        
+        conversation = []
+        for entry in recent_history:
+            conversation.append(f"Human: {entry.user_message}")
+            if entry.bot_message:
+                conversation.append(f"Assistant: {entry.bot_message}")
+        
+        return "\n".join(conversation)
+    except Exception as e:
+        app.logger.error(f"Error getting conversation history: {str(e)}")
+        return ""
+
 def generate_response(user_id, user_input):
-    """Generate a response using the RAG system"""
+    """Generate a response using the RAG system with conversation context"""
     if user_id not in user_retrievers:
         return {"success": False, "message": "Please upload and process files first"}
     
     retriever = user_retrievers[user_id]
     
     try:
+        import time
         # Create the LLM
         llm = Ollama(model="deepseek-r1:1.5b")
         
-        # Create the prompt template
-        template = """You are an AI assistant helping users understand documents. Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        # Get conversation history for context
+        conversation_history = get_conversation_history(user_id, limit=5)
+        
+        # Create the prompt template with conversation context
+        template = """You are an AI assistant helping users understand documents. Use the following pieces of context to answer the question at the end. 
 
-        Context: {context}
+Consider the conversation history to maintain context and provide relevant follow-up responses. If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
-        Question: {question}
+Document Context: {context}
 
-        Answer:"""
+Conversation History:
+{conversation_history}
+
+Current Question: {question}
+
+Answer:"""
         
         prompt = PromptTemplate(
             template=template,
-            input_variables=["context", "question"]
+            input_variables=["context", "conversation_history", "question"]
         )
         
         # Create the chain
         chain = LLMChain(llm=llm, prompt=prompt)
         
-        # Get relevant documents
+        # Get relevant documents (vector search latency)
+        start_time = time.time()
         docs = retriever.get_relevant_documents(user_input)
+        vector_search_latency_ms = (time.time() - start_time) * 1000
+        app.logger.info(f"Vector search latency: {vector_search_latency_ms:.2f} ms for user {user_id}")
         
         # Combine documents
         combined_docs = "\n\n".join([doc.page_content for doc in docs])
         
-        # Generate response
-        response = chain.run(context=combined_docs, question=user_input)
+        # Generate response with conversation context
+        response = chain.run(
+            context=combined_docs, 
+            conversation_history=conversation_history,
+            question=user_input
+        )
         
         # Get sources
         sources = list(set([doc.metadata.get('source', 'Unknown') for doc in docs]))
@@ -210,7 +247,8 @@ def generate_response(user_id, user_input):
         return {
             "success": True,
             "message": response,
-            "sources": sources
+            "sources": sources,
+            "vector_search_latency_ms": round(vector_search_latency_ms, 2)
         }
     except Exception as e:
         return {"success": False, "message": f"Error generating response: {str(e)}"}
