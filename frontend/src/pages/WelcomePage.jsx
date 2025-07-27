@@ -29,7 +29,7 @@ function WelcomePage() {
         <div className="bg-slate-800 rounded-xl shadow-xl p-8">
           <p className="text-slate-300 text-center mb-8">
             Welcome to the Proxima Chat's Document Intelligence System. 
-            This system allows you to ask questions about parliamentary documents and get accurate answers.
+            This system allows you to ask questions about documents and get accurate answers.
           </p>
 
           {/* Features Grid */}

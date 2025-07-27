@@ -7,7 +7,7 @@ function WelcomeMessage() {
       <div className="w-16 h-16 bg-slate-800 rounded-xl flex items-center justify-center mb-6">
         <FaRobot className="text-blue-400 text-3xl" />
       </div>
-      <h2 className="text-2xl font-bold text-white mb-2">Welcome to the Parliament Document System!</h2>
+      <h2 className="text-2xl font-bold text-white mb-2">Welcome to the Proxima Chat</h2>
       <p className="text-slate-400 mb-8">Upload PDF documents and ask questions about them.</p>
       
       <div className="max-w-md w-full space-y-4">
