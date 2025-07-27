@@ -46,6 +46,57 @@ A modern web application that combines Flask backend with React frontend, implem
 - Tailwind CSS
 - ESLint
 
+## System Architecture
+
+```mermaid
+graph TB
+    subgraph Frontend
+        UI[React UI]
+        Auth[Authentication]
+        Chat[Chat Interface]
+        Settings[Settings Panel]
+    end
+
+    subgraph Backend
+        API[Flask API]
+        AuthHandler[Auth Handler]
+        DocProcessor[Document Processor]
+        VectorStore[FAISS Vector Store]
+        DB[(PostgreSQL)]
+    end
+
+    subgraph External
+        PDF[PDF Documents]
+    end
+
+    %% Frontend connections
+    UI --> Auth
+    UI --> Chat
+    UI --> Settings
+    Auth --> API
+    Chat --> API
+    Settings --> API
+
+    %% Backend connections
+    API --> AuthHandler
+    API --> DocProcessor
+    DocProcessor --> VectorStore
+    AuthHandler --> DB
+    DocProcessor --> DB
+
+    %% External connections
+    PDF --> DocProcessor
+
+    %% Styling
+    classDef frontend fill:#f9f,stroke:#333,stroke-width:2px
+    classDef backend fill:#bbf,stroke:#333,stroke-width:2px
+    classDef external fill:#bfb,stroke:#333,stroke-width:2px
+
+    class UI,Auth,Chat,Settings frontend
+    class API,AuthHandler,DocProcessor,VectorStore,DB backend
+    class PDF external
+```
+
 ## Project Structure
 
 ```
